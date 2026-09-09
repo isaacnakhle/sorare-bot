@@ -1,0 +1,49 @@
+name: Sorare Floor Price Alert
+
+on:
+  schedule:
+    # Every 2 minutes - matches roughly how long one sweep takes, so this
+    # is close to continuous coverage without runs overlapping. Only
+    # sensible because the repo is public (unlimited free Actions minutes).
+    - cron: "*/2 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Send a fake test alert instead of a real sweep (checks Telegram/email delivery works)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # needed so the workflow can commit the updated state file
+
+jobs:
+  check-prices:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the alert bot
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          SORARE_API_TOKEN: ${{ secrets.SORARE_API_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_ALERT: ${{ github.event.inputs.test_alert }}
+        run: python sorare_floor_alert.py
+
+      - name: Save progress back to the repo
+        run: |
+          git config user.name "sorare-bot"
+          git config user.email "actions@github.com"
+          git add sorare_floor_state.json sorare_all_players.json || true
+          git diff --cached --quiet || git commit -m "Update bot state [skip ci]"
+          git push || true
