@@ -30,9 +30,8 @@ import requests
 
 API_TOKEN = os.environ.get("SORARE_API_TOKEN", "")
 
-DISCOUNT_PERCENT = 0.01      # TEMP: 1% stress test - confirming the alert
-                               # mechanism actually fires on real data before
-                               # tuning back up to a meaningful threshold
+DISCOUNT_PERCENT = 0.10      # alert if cheapest listing is >= 10% below
+                               # the next-cheapest active listing
 MAX_FLOOR_FOR_ALERT = 10.0   # only alert if the floor itself was < $10
 HARD_PRICE_CAP = 10.0        # extra safety net: never alert above this,
                               # no matter what the floor math says
@@ -224,11 +223,19 @@ def get_all_player_slugs():
 
 
 def _extract_listings(cards_block):
-    """Pulls sorted (price, card_slug) tuples from one cards connection block."""
+    """
+    Pulls sorted (price, card_slug) tuples from one cards connection block.
+    Also returns how many cards the filter returned in total, regardless of
+    whether they're actively listed - lets us tell "the filter returned no
+    cards at all" apart from "cards exist but none are for sale right now".
+    """
     listings = []
+    raw_count = 0
     if not cards_block:
-        return listings
-    for card in cards_block.get("nodes", []):
+        return listings, raw_count
+    nodes = cards_block.get("nodes", [])
+    raw_count = len(nodes)
+    for card in nodes:
         offer = card.get("liveSingleSaleOffer")
         prices = card.get("publicMinPrices")
         if offer and prices and prices.get("usd") is not None:
@@ -236,7 +243,7 @@ def _extract_listings(cards_block):
                 listings.append((float(prices["usd"]), card["slug"]))
             except (TypeError, ValueError):
                 continue
-    return sorted(listings, key=lambda x: x[0])
+    return sorted(listings, key=lambda x: x[0]), raw_count
 
 
 _first_error_printed = False
@@ -244,12 +251,18 @@ _first_error_printed = False
 
 def fetch_listings(slug: str):
     """
-    Returns (player_slug, {"classic": [(price, card_slug), ...],
-                            "inseason": [(price, card_slug), ...]})
+    Returns (player_slug, {
+        "classic": {"listings": [(price, card_slug), ...], "raw_count": int},
+        "inseason": {"listings": [...], "raw_count": int},
+    })
     - kept separate because Classic and In Season cards behave very
       differently price-wise and shouldn't share one combined floor.
+    raw_count = how many cards the filter matched at all, regardless of
+    whether they're currently listed for sale.
     """
     global _first_error_printed
+    empty = {"classic": {"listings": [], "raw_count": 0},
+             "inseason": {"listings": [], "raw_count": 0}}
     try:
         resp = requests.post(
             SORARE_API_URL,
@@ -265,19 +278,22 @@ def fetch_listings(slug: str):
                 print(f"GraphQL error on player listing query (showing first "
                       f"occurrence only) for [{slug}]: {data['errors']}")
                 _first_error_printed = True
-            return slug, {"classic": [], "inseason": []}
+            return slug, empty
 
         player = data["data"]["football"]["player"]
         if not player:
-            return slug, {"classic": [], "inseason": []}
+            return slug, empty
+
+        classic_listings, classic_raw = _extract_listings(player.get("classicCards"))
+        inseason_listings, inseason_raw = _extract_listings(player.get("inSeasonCards"))
 
         return slug, {
-            "classic": _extract_listings(player.get("classicCards")),
-            "inseason": _extract_listings(player.get("inSeasonCards")),
+            "classic": {"listings": classic_listings, "raw_count": classic_raw},
+            "inseason": {"listings": inseason_listings, "raw_count": inseason_raw},
         }
 
     except requests.RequestException:
-        return slug, {"classic": [], "inseason": []}
+        return slug, empty
 
 
 def send_email(subject: str, body: str):
@@ -355,9 +371,6 @@ def process_results(results, alerted: dict):
 
     `alerted` is a small dedup set (card_slug -> True) so the same still-
     listed card doesn't ping you again every single run while it sits there.
-
-    Returns diagnostic counters so we can actually verify this is finding
-    real comparable pairs, not just silently skipping everything.
     """
     players_with_no_listings = 0
     players_with_one_listing = 0
@@ -365,9 +378,13 @@ def process_results(results, alerted: dict):
     under_cap_pairs = 0
     smallest_gap_seen = None  # (gap_pct, player_slug, season_type)
     alerts_fired = 0
+    total_raw_cards_seen = 0
 
     for slug, by_season in results:
-        for season_type, listings in by_season.items():
+        for season_type, block in by_season.items():
+            listings = block["listings"]
+            total_raw_cards_seen += block["raw_count"]
+
             if len(listings) == 0:
                 players_with_no_listings += 1
                 continue
@@ -395,9 +412,12 @@ def process_results(results, alerted: dict):
                     alerted[cheapest_slug] = True
                     alerts_fired += 1
 
-    print(f"DIAGNOSTICS: {players_with_no_listings} player-seasons with 0 listings, "
-          f"{players_with_one_listing} with exactly 1 listing (can't compare), "
-          f"{comparable_pairs} with 2+ listings (comparable), "
+    print(f"DIAGNOSTICS: {total_raw_cards_seen} total cards matched by the filter "
+          f"(regardless of whether listed) - if this is ~0, the classicOnly/"
+          f"inSeasonEligible filter itself is the problem, not the market.")
+    print(f"  {players_with_no_listings} player-seasons with 0 ACTIVE listings, "
+          f"{players_with_one_listing} with exactly 1 (can't compare), "
+          f"{comparable_pairs} with 2+ (comparable), "
           f"{under_cap_pairs} of those under ${MAX_FLOOR_FOR_ALERT} cap.")
     if smallest_gap_seen:
         print(f"Biggest gap seen this run: {smallest_gap_seen[0]:.1f}% "
