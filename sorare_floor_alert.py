@@ -68,16 +68,16 @@ query WatchedPlayerListings($slug: String!) {
   football {
     player(slug: $slug) {
       slug
-      cards(rarities: [limited], first: 25) {
-        nodes {
-          slug
-          inSeasonEligible
-          liveSingleSaleOffer {
-            id
-          }
-          publicMinPrices {
-            usd
-          }
+      classicLowest: lowestPriceAnyCard(inSeason: false, rarity: limited) {
+        slug
+        publicMinPrices {
+          usd
+        }
+      }
+      inSeasonLowest: lowestPriceAnyCard(inSeason: true, rarity: limited) {
+        slug
+        publicMinPrices {
+          usd
         }
       }
     }
@@ -212,35 +212,20 @@ def get_all_player_slugs():
     return slugs
 
 
-def _extract_listings(cards_block):
+def _extract_price(lowest_card):
     """
-    Pulls sorted (price, card_slug) tuples from one cards connection block,
-    split into classic vs in-season using the real `inSeasonEligible` field
-    on each card (confirmed to exist in Sorare's schema) - done client-side
-    in Python since the server-side classicOnly/inSeasonEligible filter
-    arguments turned out to return nothing when tried directly on this field.
-    Also returns how many cards were seen in total (raw_count), regardless
-    of whether they're actively listed.
+    Pulls (price, card_slug) from one lowestPriceAnyCard result, or None if
+    that player has no active listing for this season/rarity right now.
     """
-    classic, inseason = [], []
-    raw_count = 0
-    if not cards_block:
-        return classic, inseason, raw_count
-    nodes = cards_block.get("nodes", [])
-    raw_count = len(nodes)
-    for card in nodes:
-        offer = card.get("liveSingleSaleOffer")
-        prices = card.get("publicMinPrices")
-        if offer and prices and prices.get("usd") is not None:
-            try:
-                entry = (float(prices["usd"]), card["slug"])
-            except (TypeError, ValueError):
-                continue
-            if card.get("inSeasonEligible"):
-                inseason.append(entry)
-            else:
-                classic.append(entry)
-    return sorted(classic, key=lambda x: x[0]), sorted(inseason, key=lambda x: x[0]), raw_count
+    if not lowest_card:
+        return None
+    prices = lowest_card.get("publicMinPrices")
+    if not prices or prices.get("usd") is None:
+        return None
+    try:
+        return (float(prices["usd"]), lowest_card["slug"])
+    except (TypeError, ValueError):
+        return None
 
 
 _first_error_printed = False
@@ -249,15 +234,17 @@ _first_error_printed = False
 def fetch_listings(slug: str):
     """
     Returns (player_slug, {
-        "classic": {"listings": [(price, card_slug), ...], "raw_count": int},
-        "inseason": {"listings": [(price, card_slug), ...], "raw_count": int},
+        "classic": (price, card_slug) or None,
+        "inseason": (price, card_slug) or None,
     })
-    Classic vs In Season is split client-side using the real inSeasonEligible
-    field on each card (see _extract_listings).
+    Uses Sorare's purpose-built lowestPriceAnyCard field - directly returns
+    the single cheapest actively-listed card for that season/rarity, rather
+    than paginating an arbitrary slice of a player's cards and hoping one
+    happens to be listed (which is what silently returned zero results
+    before - most of a player's cards aren't for sale at any given moment).
     """
     global _first_error_printed
-    empty = {"classic": {"listings": [], "raw_count": 0},
-             "inseason": {"listings": [], "raw_count": 0}}
+    empty = {"classic": None, "inseason": None}
     try:
         resp = requests.post(
             SORARE_API_URL,
@@ -279,12 +266,9 @@ def fetch_listings(slug: str):
         if not player:
             return slug, empty
 
-        classic, inseason, raw_count = _extract_listings(player.get("cards"))
-        # raw_count attributed only to "classic" so process_results (which
-        # sums raw_count across both buckets) doesn't double-count it
         return slug, {
-            "classic": {"listings": classic, "raw_count": raw_count},
-            "inseason": {"listings": inseason, "raw_count": 0},
+            "classic": _extract_price(player.get("classicLowest")),
+            "inseason": _extract_price(player.get("inSeasonLowest")),
         }
 
     except requests.RequestException:
@@ -333,22 +317,22 @@ def send_telegram(text: str):
         print(f"Telegram failed: {e}")
 
 
-def alert(player_slug: str, card_slug: str, display_price: float, next_cheapest: float, season_type: str):
+def alert(player_slug: str, card_slug: str, display_price: float, previous_floor: float, season_type: str):
     # Hard safety net - never alert above the price cap you actually care about.
     if display_price > HARD_PRICE_CAP:
         return
 
     card_url = f"https://sorare.com/football/cards/{card_slug}"
-    discount = next_cheapest - display_price
-    discount_pct = (discount / next_cheapest) * 100 if next_cheapest else 0
+    discount = previous_floor - display_price
+    discount_pct = (discount / previous_floor) * 100 if previous_floor else 0
     season_label = "In Season" if season_type == "inseason" else "Classic"
 
     text = (
         f"\U0001F4B0 Sorare cheapie found! ({season_label})\n\n"
         f"Player: {player_slug}\n"
         f"Price: ${display_price:.2f} {CURRENCY}\n"
-        f"Next cheapest listed: ${next_cheapest:.2f}\n"
-        f"Discount: ${discount:.2f} ({discount_pct:.0f}%) below next cheapest\n\n"
+        f"Previous lowest seen: ${previous_floor:.2f}\n"
+        f"Discount: ${discount:.2f} ({discount_pct:.0f}%) below that\n\n"
         f"Buy it here: {card_url}\n\n"
         f"({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})"
     )
@@ -357,67 +341,61 @@ def alert(player_slug: str, card_slug: str, display_price: float, next_cheapest:
     send_telegram(text)
 
 
-def process_results(results, alerted: dict):
+def process_results(results, floors: dict):
     """
-    No history needed. For each player+season, compares the CHEAPEST active
-    listing against the NEXT-CHEAPEST active listing right now. If the
-    cheapest one undercuts the next-cheapest by >= DISCOUNT_PERCENT (and the
-    next-cheapest itself is under MAX_FLOOR_FOR_ALERT), that's a steal.
-
-    `alerted` is a small dedup set (card_slug -> True) so the same still-
-    listed card doesn't ping you again every single run while it sits there.
+    Each run gets ONE current price per player+season (the cheapest active
+    listing, straight from Sorare's lowestPriceAnyCard field). We compare it
+    against the lowest price we've ever recorded for that player+season
+    (`floors`, keyed as "slug:classic" / "slug:inseason"). The floor only
+    ever moves DOWN, never up, so it's a true rolling minimum rather than
+    "whatever price I last happened to see" - a real drop gets caught even
+    if it happens gradually across several runs, not just in one big jump.
     """
-    players_with_no_listings = 0
-    players_with_one_listing = 0
-    comparable_pairs = 0
+    players_with_no_price = 0
+    new_baselines = 0
+    tracked_pairs = 0
     under_cap_pairs = 0
-    smallest_gap_seen = None  # (gap_pct, player_slug, season_type)
+    biggest_drop_seen = None  # (drop_pct, key)
     alerts_fired = 0
-    total_raw_cards_seen = 0
 
     for slug, by_season in results:
-        for season_type, block in by_season.items():
-            listings = block["listings"]
-            total_raw_cards_seen += block["raw_count"]
+        for season_type, current in by_season.items():
+            key = f"{slug}:{season_type}"
 
-            if len(listings) == 0:
-                players_with_no_listings += 1
-                continue
-            if len(listings) == 1:
-                players_with_one_listing += 1
+            if current is None:
+                players_with_no_price += 1
                 continue
 
-            comparable_pairs += 1
-            cheapest_price, cheapest_slug = listings[0]
-            next_price, _ = listings[1]
+            current_price, current_card_slug = current
+            previous_floor = floors.get(key)
 
-            gap_pct = ((next_price - cheapest_price) / next_price) * 100 if next_price else 0
-            if smallest_gap_seen is None or gap_pct > smallest_gap_seen[0]:
-                smallest_gap_seen = (gap_pct, slug, season_type)
+            if previous_floor is None:
+                floors[key] = current_price
+                new_baselines += 1
+                continue
 
-            if next_price < MAX_FLOOR_FOR_ALERT:
+            tracked_pairs += 1
+            drop_pct = ((previous_floor - current_price) / previous_floor) * 100 if previous_floor else 0
+            if biggest_drop_seen is None or drop_pct > biggest_drop_seen[0]:
+                biggest_drop_seen = (drop_pct, key)
+
+            if previous_floor < MAX_FLOOR_FOR_ALERT:
                 under_cap_pairs += 1
-
-            if cheapest_slug in alerted:
-                continue  # already told you about this exact card
-
-            if next_price < MAX_FLOOR_FOR_ALERT:
-                if cheapest_price <= next_price * (1 - DISCOUNT_PERCENT):
-                    alert(slug, cheapest_slug, cheapest_price, next_price, season_type)
-                    alerted[cheapest_slug] = True
+                if current_price <= previous_floor * (1 - DISCOUNT_PERCENT):
+                    alert(slug, current_card_slug, current_price, previous_floor, season_type)
                     alerts_fired += 1
 
-    print(f"DIAGNOSTICS: {total_raw_cards_seen} total cards seen "
-          f"(Classic+In Season split client-side via inSeasonEligible field).")
-    print(f"  {players_with_no_listings} player-seasons with 0 ACTIVE listings, "
-          f"{players_with_one_listing} with exactly 1 (can't compare), "
-          f"{comparable_pairs} with 2+ (comparable), "
-          f"{under_cap_pairs} of those under ${MAX_FLOOR_FOR_ALERT} cap.")
-    if smallest_gap_seen:
-        print(f"Biggest gap seen this run: {smallest_gap_seen[0]:.1f}% "
-              f"on {smallest_gap_seen[1]} ({smallest_gap_seen[2]})")
+            if current_price < previous_floor:
+                floors[key] = current_price
+
+    print(f"DIAGNOSTICS: {players_with_no_price} player-seasons with no active "
+          f"listing right now, {new_baselines} new (baseline just recorded), "
+          f"{tracked_pairs} compared against a known floor "
+          f"({under_cap_pairs} of those floors under ${MAX_FLOOR_FOR_ALERT}).")
+    if biggest_drop_seen:
+        print(f"Biggest drop seen this run: {biggest_drop_seen[0]:.1f}% on {biggest_drop_seen[1]}")
     else:
-        print("No comparable pairs at all this run.")
+        print("No prices to compare against a floor yet this run.")
     print(f"Alerts fired this run: {alerts_fired}")
 
 
@@ -432,7 +410,7 @@ def run_test_alert():
         player_slug="test-player-kylian-mbappe",
         card_slug="test-card-slug-example",
         display_price=6.50,
-        next_cheapest=9.00,
+        previous_floor=9.00,
         season_type="inseason",
     )
     print("Test alert sent (if Telegram/email are configured correctly, "
@@ -451,9 +429,9 @@ def main():
         print("Could not get a player list - check CLUBS_READY_QUERY / CLUB_PLAYERS_QUERY / API token.")
         return
 
-    state = load_json(STATE_FILE, {"position": 0, "alerted": {}})
+    state = load_json(STATE_FILE, {"position": 0, "floors": {}})
     position = state.get("position", 0)
-    alerted = state.get("alerted", {})
+    floors = state.get("floors", {})
 
     if position >= len(all_slugs):
         position = 0  # completed a full sweep, start over
@@ -465,10 +443,10 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
         results = list(pool.map(fetch_listings, batch))
 
-    process_results(results, alerted)
+    process_results(results, floors)
 
     state["position"] = position + BATCH_SIZE
-    state["alerted"] = alerted
+    state["floors"] = floors
     save_json(STATE_FILE, state)
 
     print("Run complete.")
